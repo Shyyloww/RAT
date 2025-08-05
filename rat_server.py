@@ -63,11 +63,8 @@ async def route_messages(websocket, role, initial_data):
             client_id = initial_data.get("id")
             # Re-package the message for broadcasting to panels
             broadcast_payload = json.dumps({
-                "type": "screen_data",
-                "session_id": client_id,
-                "data": data.get("data"),
-                "width": data.get("width"),
-                "height": data.get("height")
+                "type": "screen_data", "session_id": client_id,
+                "data": data.get("data"), "width": data.get("width"), "height": data.get("height")
             })
             if CONNECTED_PANELS:
                 await asyncio.gather(
@@ -104,7 +101,10 @@ async def main():
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", 8765))
     print(f"[*] Starting plain WebSocket server on ws://{host}:{port}")
-    async with websockets.serve(handler, host, port, max_size=None):
+    
+    # ### THIS IS THE FIX ###
+    # Add a ping_interval to keep idle connections (like the panel) alive.
+    async with websockets.serve(handler, host, port, max_size=None, ping_interval=20):
         await asyncio.Future()
 
 if __name__ == "__main__":
